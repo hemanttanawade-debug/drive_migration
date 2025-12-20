@@ -231,38 +231,85 @@ class MigrationEngine:
             
             # Download or export file
             if is_google_doc:
-                success, content = src_ops.export_google_doc(
-                    file_id, mime_type, 'pdf'
+                # For Google Workspace files, try to copy directly first (preserves format)
+                logger.debug(f"Attempting to copy Google Workspace file: {file_name}")
+                
+                # Create delegated destination service
+                from auth import GoogleAuthManager
+                from config import Config
+                dest_auth = GoogleAuthManager(
+                    Config.DEST_CREDENTIALS_FILE,
+                    Config.SCOPES,
+                    delegate_email=dest_email
                 )
-                if not success:
-                    # Try to copy instead
-                    new_file_id = self.dest_ops.copy_file(
-                        file_id, file_name, dest_parent_id
-                    )
-                    if new_file_id:
-                        return self.dest_ops.transfer_ownership(new_file_id, dest_email), None
-                    return False, "Failed to copy Google Doc"
+                dest_auth.authenticate()
+                dest_drive_delegated = dest_auth.get_drive_service(user_email=dest_email)
+                
+                # Copy the file directly
+                try:
+                    file_metadata = {'name': file_name}
+                    if dest_parent_id:
+                        file_metadata['parents'] = [dest_parent_id]
+                    
+                    copied_file = dest_drive_delegated.files().copy(
+                        fileId=file_id,
+                        body=file_metadata,
+                        fields='id,name',
+                        supportsAllDrives=True
+                    ).execute()
+                    
+                    new_file_id = copied_file.get('id')
+                    logger.info(f"Copied Google Workspace file: {file_name} (ID: {new_file_id})")
+                    
+                    # File is already owned by dest_email since we used their delegated credentials
+                    return True, None
+                    
+                except Exception as copy_error:
+                    logger.warning(f"Failed to copy {file_name}, trying export: {copy_error}")
+                    
+                    # Fall back to export as Office format
+                    export_mapping = {
+                        'application/vnd.google-apps.document': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'),
+                        'application/vnd.google-apps.spreadsheet': ('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'),
+                        'application/vnd.google-apps.presentation': ('application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'),
+                        'application/vnd.google-apps.drawing': ('application/pdf', '.pdf'),
+                    }
+                    
+                    if mime_type in export_mapping:
+                        export_mime, extension = export_mapping[mime_type]
+                        success, content = src_ops.export_google_doc(file_id, mime_type, export_mime)
+                        
+                        if success and content:
+                            # Update filename and mime type for export
+                            export_name = file_name if file_name.endswith(extension) else f"{file_name}{extension}"
+                            mime_type = export_mime
+                        else:
+                            return False, f"Failed to export Google Workspace file: {file_name}"
+                    else:
+                        return False, f"Unsupported Google Workspace file type: {mime_type}"
             else:
                 success, content = src_ops.download_file(file_id, file_name)
+                if not success or content is None:
+                    return False, "Download failed"
+                export_name = file_name
             
-            if not success or content is None:
-                return False, "Download failed"
-            
-            # Upload to destination
-            new_file_id = self.dest_ops.upload_file(
-                content, file_name, mime_type, dest_parent_id
-            )
-            
-            if not new_file_id:
-                return False, "Upload failed"
-            
-            # Transfer ownership
-            ownership_success = self.dest_ops.transfer_ownership(
-                new_file_id, dest_email
-            )
-            
-            if not ownership_success:
-                logger.warning(f"File uploaded but ownership transfer failed: {file_name}")
+            # Upload regular files or exported Google files
+            if not is_google_doc or 'content' in locals():
+                new_file_id = self.dest_ops.upload_file(
+                    content, export_name if 'export_name' in locals() else file_name, 
+                    mime_type, dest_parent_id
+                )
+                
+                if not new_file_id:
+                    return False, "Upload failed"
+                
+                # Transfer ownership
+                ownership_success = self.dest_ops.transfer_ownership(
+                    new_file_id, dest_email
+                )
+                
+                if not ownership_success:
+                    logger.warning(f"File uploaded but ownership transfer failed: {file_name}")
             
             return True, None
             

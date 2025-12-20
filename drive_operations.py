@@ -146,14 +146,14 @@ class DriveOperations:
             logger.error(f"Error downloading {file_name}: {e}")
             return False, None
     
-    def export_google_doc(self, file_id: str, mime_type: str, export_format: str) -> Tuple[bool, Optional[bytes]]:
+    def export_google_doc(self, file_id: str, mime_type: str, export_format: str = None) -> Tuple[bool, Optional[bytes]]:
         """
         Export Google Workspace document
         
         Args:
             file_id: File ID
             mime_type: Source MIME type
-            export_format: Target export format
+            export_format: Target export format (MIME type or extension)
             
         Returns:
             Tuple of (success, file_content)
@@ -165,7 +165,11 @@ class DriveOperations:
             'application/vnd.google-apps.drawing': 'application/pdf',
         }
         
-        target_mime = export_mapping.get(mime_type, 'application/pdf')
+        # Use provided export_format or map from source type
+        if export_format and export_format.startswith('application/'):
+            target_mime = export_format
+        else:
+            target_mime = export_mapping.get(mime_type, 'application/pdf')
         
         try:
             request = self.drive.files().export_media(
@@ -178,8 +182,11 @@ class DriveOperations:
             done = False
             while not done:
                 status, done = downloader.next_chunk()
+                if status:
+                    logger.debug(f"Export progress: {int(status.progress() * 100)}%")
             
             file_buffer.seek(0)
+            logger.info(f"Exported Google Workspace file as {target_mime}")
             return True, file_buffer.read()
             
         except HttpError as e:
@@ -313,40 +320,51 @@ class DriveOperations:
             True if successful, False otherwise
         """
         try:
-            # Add new owner as writer first
+            # First, add the new owner with writer permission
             permission = {
                 'type': 'user',
                 'role': 'writer',
                 'emailAddress': new_owner_email
             }
             
-            self.drive.permissions().create(
+            result = self.drive.permissions().create(
                 fileId=file_id,
                 body=permission,
                 sendNotificationEmail=False,
+                supportsAllDrives=True,
+                fields='id'
+            ).execute()
+            
+            permission_id = result.get('id')
+            
+            if not permission_id:
+                logger.error(f"Failed to get permission ID for {new_owner_email}")
+                return False
+            
+            # Now update that permission to owner role
+            owner_permission = {
+                'role': 'owner'
+            }
+            
+            self.drive.permissions().update(
+                fileId=file_id,
+                permissionId=permission_id,
+                body=owner_permission,
+                transferOwnership=True,
                 supportsAllDrives=True
             ).execute()
             
-            # Then transfer ownership
-            permission['role'] = 'owner'
-            permission_id = self.get_permission_id(file_id, new_owner_email)
-            
-            if permission_id:
-                self.drive.permissions().update(
-                    fileId=file_id,
-                    permissionId=permission_id,
-                    body=permission,
-                    transferOwnership=True,
-                    supportsAllDrives=True
-                ).execute()
-                
-                logger.info(f"Transferred ownership of {file_id} to {new_owner_email}")
-                return True
-            
-            return False
+            logger.info(f"Transferred ownership of {file_id} to {new_owner_email}")
+            return True
             
         except HttpError as e:
-            logger.error(f"Error transferring ownership of {file_id}: {e}")
+            if e.resp.status == 403:
+                logger.warning(f"Permission denied transferring ownership of {file_id}: {e}")
+            else:
+                logger.error(f"Error transferring ownership of {file_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error transferring ownership of {file_id}: {e}")
             return False
     
     def get_permission_id(self, file_id: str, email: str) -> Optional[str]:
@@ -365,4 +383,3 @@ class DriveOperations:
             return None
         except HttpError:
             return None
-        
