@@ -32,7 +32,7 @@ class DriveOperations:
         retry=retry_if_exception_type((HttpError, ConnectionError))
     )
     def list_files(self, user_email: str, page_size: int = 100, 
-                   query: Optional[str] = None) -> List[Dict]:
+                   query: Optional[str] = None, include_shared: bool = False) -> List[Dict]:
         """
         List all files for a user
         
@@ -40,6 +40,7 @@ class DriveOperations:
             user_email: User email address
             page_size: Number of results per page
             query: Additional query filter
+            include_shared: If True, include files shared with user (not owned)
             
         Returns:
             List of file metadata dictionaries
@@ -47,8 +48,14 @@ class DriveOperations:
         files = []
         page_token = None
         
-        # Base query - all files owned by user
-        base_query = f"'{user_email}' in owners and trashed=false"
+        # Base query - files owned by user only (default)
+        if include_shared:
+            # Include both owned and shared files
+            base_query = f"('{user_email}' in owners or sharedWithMe) and trashed=false"
+        else:
+            # Only files owned by user
+            base_query = f"'{user_email}' in owners and trashed=false"
+        
         if query:
             base_query = f"{base_query} and ({query})"
         
@@ -68,6 +75,14 @@ class DriveOperations:
                 ).execute()
                 
                 batch_files = response.get('files', [])
+                
+                # Filter to only owned files if not including shared
+                if not include_shared:
+                    batch_files = [
+                        f for f in batch_files
+                        if any(owner.get('emailAddress') == user_email for owner in f.get('owners', []))
+                    ]
+                
                 files.extend(batch_files)
                 
                 logger.debug(f"Retrieved {len(batch_files)} files (total: {len(files)})")
